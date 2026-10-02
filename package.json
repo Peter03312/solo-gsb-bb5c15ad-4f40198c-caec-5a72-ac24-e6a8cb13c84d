@@ -13,7 +13,8 @@
     "test:blockade": "node test/blockade-http.cjs",
     "test:handover": "node test/handover-http.cjs",
     "test:yards": "node test/yards-http.cjs",
-    "test": "npm run smoke && npm run test:waiting && npm run test:cancel && npm run test:blockade && npm run test:handover && npm run test:yards"
+    "test:runplan": "node test/runplan-http.cjs",
+    "test": "npm run smoke && npm run test:waiting && npm run test:cancel && npm run test:blockade && npm run test:handover && npm run test:yards && npm run test:runplan"
   },
   "engines": {
     "node": ">=18"

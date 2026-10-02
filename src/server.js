@@ -13,6 +13,7 @@ const { InterlockError } = require('./interlocking');
 const waiting = require('./waiting');
 const cancellation = require('./cancellation');
 const blockade = require('./blockade');
+const runplan = require('./runplan');
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -56,6 +57,10 @@ for (const y of yards.listYards()) {
 // 启动延时取消到期处理：立即扫描一次（处理重启期间已到期的申请，逐站场），
 // 之后每 0.5s 全站场扫描
 cancellation.startScheduler();
+
+// 启动定时走行计划处理：立即扫描一次（重启后逾期步骤依序处理，逐站场），
+// 之后每 0.5s 全站场扫描（创建副本不复制活动计划）
+runplan.startScheduler();
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));

@@ -7,6 +7,7 @@ const waiting = require('../waiting');
 const cancellation = require('../cancellation');
 const blockade = require('../blockade');
 const handover = require('../handover');
+const runplan = require('../runplan');
 const { InterlockError } = require('../interlocking');
 
 const router = express.Router();
@@ -104,6 +105,45 @@ router.get('/cancellations', wrap((req, res) => {
     protectionSeconds: cancellation.getProtectionSeconds(),
     me: req.session.name
   });
+}));
+
+/* ------------------------------ 定时走行计划 ------------------------------ */
+
+// 提交定时走行计划（仅已开放且尚未走行的实例；步骤须覆盖完整进路；
+// 同一实例没有其他活动计划；非法计划整体拒绝）
+router.post('/instances/:id/run-plans', wrap((req, res) => {
+  const plan = runplan.submitPlan(
+    Number(req.params.id), (req.body || {}).steps, req.session.name
+  );
+  res.status(201).json({ ok: true, plan });
+}));
+
+// 查看定时走行计划：默认本人全部；?scope=all 全员（值班台仲裁展示）；
+// 可选 ?status=active|completed|stopped（也随 /api/state 的 runPlans /
+// activeRunPlansByInstance 下发）
+router.get('/run-plans', wrap((req, res) => {
+  const scope = String(req.query.scope || 'mine');
+  const status = ['active', 'completed', 'stopped'].includes(req.query.status)
+    ? req.query.status : null;
+  const plans = runplan.listPlans({
+    applicant: scope === 'all' ? undefined : req.session.name,
+    status
+  });
+  res.json({ ok: true, plans, me: req.session.name });
+}));
+
+// 单张计划详情
+router.get('/run-plans/:id', wrap((req, res) => {
+  const plan = runplan.getPlan(Number(req.params.id));
+  if (!plan) throw new InterlockError(404, 'RUNPLAN_NOT_FOUND',
+    `定时走行计划 ${req.params.id} 不存在`);
+  res.json({ ok: true, plan });
+}));
+
+// 本人终止活动计划：仅停止后续注入，不解除进路、不改动已注入事件
+router.post('/run-plans/:id/terminate', wrap((req, res) => {
+  const plan = runplan.terminatePlan(Number(req.params.id), req.session.name);
+  res.json({ ok: true, plan });
 }));
 
 /* ------------------------------ 临时封锁（只读） ------------------------------ */

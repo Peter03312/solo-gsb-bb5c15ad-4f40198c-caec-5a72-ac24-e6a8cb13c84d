@@ -215,6 +215,8 @@ function processOneInTxn(row) {
       WHERE id=?`
   ).run(inst.id);
   db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(inst.id);
+  // 实例解除使活动定时走行计划前提失效：同事务停止（不覆盖人工/取消结果）
+  require('./runplan').onInstanceReleasedInTxn(inst.id);
   db.prepare(
     `UPDATE cancellation_applications SET status='released', processed_at=?,
             end_reason='保护期满且核验通过（进路仍开放、无走行占用、沿途区段均空闲），进路已解除'

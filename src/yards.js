@@ -45,6 +45,7 @@ const AUTOINCR_TABLES = [
   'route_steps', 'route_switch_reqs', 'route_instances', 'route_locks',
   'section_events', 'waiting_applications', 'cancellation_applications',
   'blockade_applications', 'handover_documents'
+  // 注：run_plans / run_plan_steps 不随副本复制（活动计划不进入副本），故不在此列
 ];
 
 /** 站场定义表（整表复制） */
@@ -167,7 +168,10 @@ const ALL_BUSINESS_TABLES = [
   'sections', 'switches', 'signals', 'routes', 'route_steps', 'route_switch_reqs',
   'route_instances', 'route_locks', 'section_events',
   'waiting_applications', 'cancellation_applications', 'blockade_applications',
-  'handover_documents'
+  'handover_documents',
+  // 定时走行计划：旧库升级时整体迁移到原站场业务库；
+  // 但创建副本时不复制活动计划（copyOriginalData 的复制清单刻意不含这两张表）。
+  'run_plans', 'run_plan_steps'
 ];
 
 /* ------------------------------ 副本创建 ------------------------------ */

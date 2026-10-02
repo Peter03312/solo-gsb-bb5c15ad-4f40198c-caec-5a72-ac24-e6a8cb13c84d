@@ -205,6 +205,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_blockade_unfinished_section
   ON blockade_applications(section_id) WHERE status IN ('pending','active');
 CREATE INDEX IF NOT EXISTS idx_blockade_status ON blockade_applications(status, id);
 
+-- 定时走行计划：值班员对【已开放且尚未走行】的进路实例提交的自动走行脚本。
+--  - 步骤按进路区段顺序交替为 占用/清空（每段一对，共 2×区段数 步），每步等待
+--    正整数秒；首步从提交时刻计时，后续步的到期时刻在提交时按步依次累加确定，
+--    上一步成功后下一步的等待即已含在该时刻内（重启后逾期步骤依序立即处理）；
+--  - 到期时沿用现有事件序号与走行校验（interlocking.submitSectionEventInTxn），
+--    在同一事务内提交事件并推进计划：信号回红、逐段解锁、等待兑现均遵循现有规则；
+--  - 人工事件抢先、延时取消到期解除、实例解除等使前提失效时计划转为 stopped，
+--    写明原因且不覆盖人工结果；已执行步骤（executed_at 非空）绝不重复注入事件；
+--  - 末步成功后计划 completed；本人终止仅停止后续注入，不解除进路；
+--  - 副本创建时不复制活动计划（本表数据不进入复制清单）。
+-- instance_id 外键级联：管理员重置删除进路实例时计划与步骤一并清除。
+CREATE TABLE IF NOT EXISTS run_plans (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  instance_id  INTEGER NOT NULL REFERENCES route_instances(id) ON DELETE CASCADE,
+  applicant    TEXT NOT NULL,             -- 提交人（值班员姓名）
+  -- active 进行中 / completed 末步成功已完成 / stopped 前提失效或本人终止
+  status       TEXT NOT NULL DEFAULT 'active'
+               CHECK (status IN ('active','completed','stopped')),
+  submitted_at INTEGER NOT NULL,          -- 提交时刻（epoch 毫秒）
+  finished_at  INTEGER,                   -- 进入终态的时刻（epoch 毫秒）
+  end_reason   TEXT,                      -- 完成/停止说明
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 同一进路实例同时至多一笔活动计划（同一实例没有其他活动计划）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runplan_active_instance
+  ON run_plans(instance_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_runplan_status ON run_plans(status, id);
+CREATE INDEX IF NOT EXISTS idx_runplan_applicant ON run_plans(applicant);
+
+-- 定时走行计划步骤：每步对应一个将由系统代发的走行事件（占用/清空某区段）。
+-- event_seq 为实际注入时使用的事件序号（应等于 step_order）；executed_at 非空
+-- 表示该步已成功注入——任何重复触发都跳过，绝不重发事件。
+CREATE TABLE IF NOT EXISTS run_plan_steps (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id      INTEGER NOT NULL REFERENCES run_plans(id) ON DELETE CASCADE,
+  step_order   INTEGER NOT NULL,          -- 从 1 开始（与走行事件序号一一对应）
+  action       TEXT NOT NULL CHECK (action IN ('occupy','clear')),
+  section_id   TEXT NOT NULL,
+  wait_seconds INTEGER NOT NULL,          -- 本步等待时长（正整数秒）
+  due_at       INTEGER NOT NULL,          -- 到期时刻（epoch 毫秒；提交时算定，不随后续变化）
+  executed_at  INTEGER,                   -- 实际成功注入时刻（NULL=待执行）
+  event_seq    INTEGER,                   -- 实际注入使用的事件序号
+  UNIQUE (plan_id, step_order)
+);
+CREATE INDEX IF NOT EXISTS idx_runplan_steps_due
+  ON run_plan_steps(plan_id, step_order);
+
 -- 交接班交接单（历史交接单只留在原站场，不随副本复制）：
 --  - 交班值班员生成时，在同一事务内快照六类状态：区段占用、道岔位置、
 --    开放进路（信号与走行进度）、等待申请、延时取消申请、未结束封锁，
