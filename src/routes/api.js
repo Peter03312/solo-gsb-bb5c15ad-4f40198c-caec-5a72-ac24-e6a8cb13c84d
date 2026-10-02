@@ -7,6 +7,7 @@ const waiting = require('../waiting');
 const cancellation = require('../cancellation');
 const blockade = require('../blockade');
 const handover = require('../handover');
+const movementPlan = require('../movement-plan');
 const { InterlockError } = require('../interlocking');
 
 const router = express.Router();
@@ -74,6 +75,43 @@ router.post('/instances/:id/events', wrap((req, res) => {
 router.post('/instances/:id/release', wrap((req, res) => {
   const detail = inter.releaseInstance(Number(req.params.id), req.session.name);
   res.json({ ok: true, instance: detail });
+}));
+
+/* ------------------------------ 定时走行计划 ------------------------------ */
+
+// 提交定时走行计划（仅已开放且尚未走行的实例；步骤须覆盖完整进路、
+// 占用/清空交替、每步正整数秒；非法计划整体拒绝）
+router.post('/instances/:id/movement-plans', wrap((req, res) => {
+  const plan = movementPlan.submitPlan(
+    Number(req.params.id), (req.body || {}).steps, req.session.name);
+  res.status(201).json({ ok: true, plan });
+}));
+
+// 查看定时走行计划：默认本人全部；?scope=all 全员（值班台仲裁展示）；
+// 可选 ?status=active|completed|aborted|terminated
+router.get('/movement-plans', wrap((req, res) => {
+  const scope = String(req.query.scope || 'mine');
+  const status = ['active', 'completed', 'aborted', 'terminated'].includes(req.query.status)
+    ? req.query.status : null;
+  const list = movementPlan.listPlans({
+    applicant: scope === 'all' ? undefined : req.session.name,
+    status
+  });
+  res.json({ ok: true, plans: list, me: req.session.name });
+}));
+
+// 查看单张定时走行计划（含全部步骤与到期时刻）
+router.get('/movement-plans/:id', wrap((req, res) => {
+  const plan = movementPlan.getPlan(Number(req.params.id));
+  if (!plan) throw new InterlockError(404, 'MOVEMENT_PLAN_NOT_FOUND',
+    `定时走行计划 ${req.params.id} 不存在`);
+  res.json({ ok: true, plan, me: req.session.name });
+}));
+
+// 本人终止计划：仅停止后续定时注入，不解除进路、不改动已注入走行结果
+router.post('/movement-plans/:id/terminate', wrap((req, res) => {
+  const plan = movementPlan.terminatePlan(Number(req.params.id), req.session.name);
+  res.json({ ok: true, plan });
 }));
 
 /* ------------------------------ 延时取消 ------------------------------ */

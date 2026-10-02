@@ -230,6 +230,7 @@ function renderSide() {
   side.appendChild(renderBlockadePanel());
   side.appendChild(renderWaitingPanel());
   side.appendChild(renderCancellationPanel());
+  side.appendChild(renderMovementPlanPanel());
   side.appendChild(renderHandoverPanel());
   side.appendChild(renderSwitchPanel());
   side.appendChild(renderSectionPanel());
@@ -589,6 +590,109 @@ function renderCancellationCard(c) {
   return card;
 }
 
+/* ----------------------------- 定时走行计划 ----------------------------- */
+
+const PLAN_STATUS = {
+  active: ['amber', '定时走行中'],
+  completed: ['green', '已完成'],
+  aborted: ['red', '已停止'],
+  terminated: ['unknown', '本人已终止']
+};
+
+function activePlanOf(instanceId) {
+  const all = STATE.activeMovementPlans || {};
+  return all[String(instanceId)] || all[instanceId] || null;
+}
+
+function renderMovementPlanPanel() {
+  const box = html('div', {});
+  box.appendChild(html('div', { class: 'section-title' }, '定时走行计划（自动按序占用/清空）'));
+  const all = STATE.movementPlans || [];
+  const mine = all.filter((p) => p.applicant === App.name());
+  const shown = mine.length ? mine : all.filter((p) => p.status === 'active').slice(0, 6);
+  if (!shown.length) {
+    box.appendChild(html('div', { class: 'hint' },
+      '暂无定时走行计划。对"已开放且尚未走行"的进路，可在下方进路卡片中编排并提交。'));
+    return box;
+  }
+  shown.forEach((p) => box.appendChild(renderMovementPlanCard(p)));
+  box.appendChild(html('div', { class: 'hint', style: 'margin-top:6px;' },
+    '首步从提交时刻计时，后续每步从上一步成功时刻计时；到期沿用现有事件序号与走行校验，' +
+    '信号回红、逐段解锁、等待兑现均按现有规则。人工事件抢先、延时取消或进路解除会使计划停止，' +
+    '不覆盖人工结果；本人终止仅停止后续注入，不解除进路。' +
+    (mine.length ? '' : '（当前仅展示活动计划；本人计划可在列表中查看全部）')));
+  return box;
+}
+
+function renderMovementPlanCard(p) {
+  const mine = p.applicant === App.name();
+  const card = html('div', {
+    class: `instance-card ${mine ? 'mine' : ''}`, id: 'plan-' + p.id
+  });
+  const [cls, txt] = PLAN_STATUS[p.status] || ['unknown', p.status];
+
+  const head = html('div', { class: 'row' });
+  head.appendChild(html('b', {}, `定时计划#${p.id}`));
+  head.appendChild(html('span', { class: 'muted' },
+    `进路实例 #${p.instanceId}（${p.routeId}，${p.applicant}${mine ? '·我' : ''}）`));
+  head.appendChild(html('span', { class: 'muted', style: 'flex:1;' }));
+  if (p.status === 'active' && p.nextStep) {
+    head.appendChild(html('span', { class: 'badge amber' },
+      `下一步 ${p.nextStep.step}/${p.totalSteps}`));
+  }
+  head.appendChild(html('span', { class: `badge ${cls}` }, txt));
+  card.appendChild(head);
+
+  if (p.status === 'active' && p.nextStep) {
+    const line = html('div', { class: 'hint', style: 'margin-top:4px;' });
+    line.appendChild(document.createTextNode(
+      `下一步：${p.nextStep.actionText} 区段 ${p.nextStep.sectionId}，到期 ` +
+      `${new Date(p.nextStep.dueAt).toLocaleTimeString()}（`));
+    line.appendChild(html('b', { 'data-countdown-to': String(p.nextStep.dueAt) },
+      formatRemaining(p.nextStep.dueAt - (Date.now() + clockOffsetMs))));
+    line.appendChild(document.createTextNode('）'));
+    card.appendChild(line);
+  }
+
+  // 步骤摘要（默认折叠；查看各步等待时长/到期时刻/产生的事件序号）
+  if (Array.isArray(p.steps) && p.steps.length) {
+    const det = html('details', { style: 'margin-top:4px;' });
+    det.appendChild(html('summary', { class: 'hint', style: 'cursor:pointer;' },
+      `全部 ${p.totalSteps} 步明细`));
+    det.appendChild(html('div', { class: 'hint' },
+      p.steps.map((s) =>
+        `${s.step}.${s.actionText}${s.sectionId} 等待${s.waitSeconds}s` +
+        (s.status === 'done' ? ` ✓#${s.eventSeq}`
+          : s.dueAt ? `（${new Date(s.dueAt).toLocaleTimeString()} 到期）` : '（待上一步）')
+      ).join('　')));
+    card.appendChild(det);
+  }
+
+  if (p.endReason) {
+    card.appendChild(html('div', {
+      class: 'hint', style: `margin-top:4px;color:${p.status === 'completed' ? 'var(--green)' : 'var(--red)'};`
+    }, (p.status === 'completed' ? '完成说明：' : '停止原因：') + p.endReason));
+  }
+
+  if (p.status === 'active' && mine) {
+    const row = html('div', { class: 'row', style: 'margin-top:6px;' });
+    const term = html('button', { class: 'danger small' }, '终止计划（仅停止注入，不解除进路）');
+    term.addEventListener('click', () => terminatePlan(p));
+    row.appendChild(term);
+    card.appendChild(row);
+  }
+  return card;
+}
+
+async function terminatePlan(p) {
+  if (!confirm(`终止定时走行计划 #${p.id}？\n仅停止后续自动注入，不解除进路、不改动已注入的走行结果。`)) return;
+  try {
+    await api(`/api/movement-plans/${p.id}/terminate`, { method: 'POST' });
+    toast(`定时走行计划 #${p.id} 已终止，进路保持原状`, 'ok', 5000);
+    await load(true);
+  } catch (e) { toast(e.message, 'err', 7000); }
+}
+
 /* ------------------------------- 交接班交接单 ------------------------------- */
 
 const HANDOVER_STATUS = {
@@ -937,6 +1041,7 @@ function renderInstanceCard(inst) {
   const card = html('div', { class: `instance-card ${mine ? 'mine' : ''}`, id: 'inst-' + inst.id });
   const route = STATE.routes.find((r) => r.id === inst.routeId);
   const cancelReq = pendingCancellationOf(inst.id);
+  const plan = activePlanOf(inst.id);
 
   const head = html('div', { class: 'row' });
   head.appendChild(html('b', {}, `#${inst.id} ${inst.routeId}`));
@@ -946,7 +1051,26 @@ function renderInstanceCard(inst) {
   head.appendChild(html('span', { class: `badge ${inst.signalState === 'green' ? 'green' : 'red'}` },
     inst.signalState === 'green' ? '信号绿' : '信号红'));
   if (cancelReq) head.appendChild(html('span', { class: 'badge amber' }, '延时取消中'));
+  if (plan) head.appendChild(html('span', { class: 'badge amber' }, '定时走行中'));
   card.appendChild(head);
+
+  // 定时走行计划状态条：下一步动作与到期倒计时
+  if (plan && plan.nextStep) {
+    const bar = html('div', {
+      class: 'reasons', id: 'plan-bar-' + plan.id, style: 'margin-top:8px;'
+    });
+    const li = html('li', { style: 'background:#eef4fd;border-color:#b9d2f3;color:#1d4e89;' });
+    li.appendChild(document.createTextNode(
+      `⏱ 定时走行计划 #${plan.id}（${plan.applicant}）：下一步 第 ${plan.nextStep.step}/${plan.totalSteps} 步 ` +
+      `${plan.nextStep.actionText} 区段 ${plan.nextStep.sectionId}，到期 ` +
+      `${new Date(plan.nextStep.dueAt).toLocaleTimeString()}（剩余 `));
+    li.appendChild(html('b', { 'data-countdown-to': String(plan.nextStep.dueAt) },
+      formatRemaining(plan.nextStep.dueAt - (Date.now() + clockOffsetMs))));
+    li.appendChild(document.createTextNode(
+      '）。到期沿用现有序号与走行校验自动注入；人工事件抢先或申请延时取消会使计划停止。'));
+    bar.appendChild(li);
+    card.appendChild(bar);
+  }
 
   // 延时取消状态条：剩余时间实时倒计时 + 最早解除时刻
   if (cancelReq) {
@@ -1064,7 +1188,98 @@ function renderInstanceCard(inst) {
     `保护时长 ${STATE.cancelProtectionSeconds} 秒（管理员设置）；到期重查满足条件才解除`));
   card.appendChild(dcRow);
 
+  card.appendChild(renderPlanEditor(inst, plan, !!cancelReq));
+
   return card;
+}
+
+/**
+ * 定时走行计划编排区：按进路区段顺序生成 占用/清空 交替的 2N 行，
+ * 每行填正整数秒等待时长；尚未走行（下一序号为 1）时才可提交。
+ */
+function renderPlanEditor(inst, active, cancelPending) {
+  const wrap = html('div', { style: 'margin-top:6px;' });
+  const hasProgress = inst.nextSeq !== 1 || (inst.events || []).length > 0;
+
+  if (active) {
+    const row = html('div', { class: 'row' });
+    const term = html('button', { class: 'danger small' }, '终止定时走行计划（不解除进路）');
+    term.addEventListener('click', () => terminatePlan(active));
+    row.appendChild(term);
+    row.appendChild(html('span', { class: 'hint' }, '本人终止仅停止后续注入，不解除进路。'));
+    wrap.appendChild(row);
+    return wrap;
+  }
+
+  const det = html('details', { id: 'plan-editor-' + inst.id });
+  const editable = !hasProgress && !cancelPending;
+  det.appendChild(html('summary', { class: 'hint', style: 'cursor:pointer;' },
+    '定时走行计划（按区段顺序自动 占用→清空，每步填正整数秒等待）'));
+
+  if (!editable) {
+    det.appendChild(html('div', { class: 'hint', style: 'margin-top:4px;color:var(--red);' },
+      hasProgress
+        ? '该进路已有走行记录，定时走行计划只能对"已开放且尚未走行"的进路提交。'
+        : '该进路已有延时取消申请，需待其结束后才能提交定时走行计划。'));
+    wrap.appendChild(det);
+    return wrap;
+  }
+
+  const grid = html('div',
+    { style: 'margin-top:6px;display:grid;grid-template-columns:1fr 110px;gap:4px 8px;' });
+  const inputs = [];
+  inst.sections.forEach((s) => {
+    for (const [action, label] of [['occupy', '占用'], ['clear', '清空']]) {
+      grid.appendChild(html('span', { class: 'hint' },
+        `${label} 区段 ${s.section_id}（步 ${inputs.length + 1}）`));
+      const inp = html('input', { type: 'number', min: '1', step: '1', value: '3', style: 'width:90px;' });
+      inputs.push({ action, sectionId: s.section_id, input: inp });
+      grid.appendChild(inp);
+    }
+  });
+  det.appendChild(grid);
+
+  const quick = html('div', { class: 'row', style: 'margin-top:6px;' });
+  quick.appendChild(html('span', { class: 'hint' }, '批量填等待秒数：'));
+  const bulk = html('input', { type: 'number', min: '1', step: '1', value: '3', style: 'width:70px;' });
+  const apply = html('button', { class: 'ghost small', type: 'button' }, '统一填入');
+  apply.addEventListener('click', () => inputs.forEach((x) => { x.input.value = bulk.value; }));
+  quick.appendChild(bulk); quick.appendChild(apply);
+  det.appendChild(quick);
+
+  const row = html('div', { class: 'row', style: 'margin-top:6px;' });
+  const submit = html('button', { class: 'primary small', type: 'button' }, '提交定时走行计划');
+  submit.addEventListener('click', () => submitMovementPlan(inst, inputs));
+  row.appendChild(submit);
+  row.appendChild(html('span', { class: 'hint' },
+    '首步从提交时刻计时，后续每步从上一步成功时刻计时；非法计划会被整体拒绝。'));
+  det.appendChild(row);
+
+  wrap.appendChild(det);
+  return wrap;
+}
+
+async function submitMovementPlan(inst, inputs) {
+  const steps = inputs.map((x) => ({
+    sectionId: x.sectionId,
+    action: x.action,
+    waitSeconds: Number(x.input.value)
+  }));
+  if (!confirm(`为进路 #${inst.id}（${inst.routeId}）提交 ${steps.length} 步定时走行计划？\n` +
+    '系统将按进路区段顺序自动提交占用/清空事件；人工事件抢先会使计划停止。')) return;
+  try {
+    const data = await api(`/api/instances/${inst.id}/movement-plans`, {
+      method: 'POST', body: JSON.stringify({ steps })
+    });
+    const p = data.plan;
+    toast(`定时走行计划 #${p.id} 已提交，第 1 步将于 ` +
+      `${new Date(p.nextStep.dueAt).toLocaleTimeString()} 到期`, 'ok', 5000);
+    await load(true);
+    setTimeout(() => {
+      const node = document.getElementById('plan-bar-' + p.id);
+      if (node) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 50);
+  } catch (e) { toast(e.message, 'err', 7000); }
 }
 
 async function requestDelayedCancel(inst) {

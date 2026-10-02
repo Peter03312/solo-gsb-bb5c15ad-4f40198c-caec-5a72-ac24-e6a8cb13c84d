@@ -9,6 +9,7 @@ const cancellation = require('../cancellation');
 const blockade = require('../blockade');
 const handover = require('../handover');
 const yards = require('../yards');
+const movementPlan = require('../movement-plan');
 
 const router = express.Router();
 router.use(requireAuth('admin'));
@@ -417,6 +418,8 @@ router.post('/reset/state', wrap((req, res) => {
   db.transaction(() => {
     // 先清除待处理的延时取消申请（随后删除实例也会级联清除，这里显式清理语义清晰）
     cancellation.clearAllByReset();
+    // 清除活动定时走行计划（随后删除实例也会级联清除，这里显式清理语义清晰）
+    movementPlan.clearAllByReset();
     db.prepare(`DELETE FROM route_instances`).run(); // 级联删除锁与事件
     db.prepare(`UPDATE sections SET occ_state='unknown'`).run();
     db.prepare(`UPDATE switches SET position='N'`).run();
@@ -438,6 +441,7 @@ router.post('/reset/training', wrap((req, res) => {
   const db = getDb();
   db.transaction(() => {
     cancellation.clearAllByReset();
+    movementPlan.clearAllByReset();
     db.prepare(`DELETE FROM route_instances`).run();
     db.prepare(`UPDATE sections SET occ_state='free'`).run();
     db.prepare(`UPDATE switches SET position='N'`).run();

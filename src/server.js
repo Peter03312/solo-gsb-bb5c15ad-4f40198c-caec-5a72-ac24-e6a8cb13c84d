@@ -13,6 +13,7 @@ const { InterlockError } = require('./interlocking');
 const waiting = require('./waiting');
 const cancellation = require('./cancellation');
 const blockade = require('./blockade');
+const movementPlan = require('./movement-plan');
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -52,6 +53,12 @@ for (const y of yards.listYards()) {
     }
   });
 }
+
+// 启动定时走行计划处理：立即扫描一次（重启后继续未完成计划，逾期步骤依序处理；
+// 放在延时取消扫描之前，保证"重启即刻"两个启动扫描不会在同一毫秒内先后注入
+// 计划的相邻步骤——后续步骤一律按"上一步成功时刻 + 等待"计时，只在 0.5s
+// 定时周期里到期），之后每 0.5s 全站场扫描；副本不复制活动计划，各站场互不串用。
+movementPlan.startScheduler();
 
 // 启动延时取消到期处理：立即扫描一次（处理重启期间已到期的申请，逐站场），
 // 之后每 0.5s 全站场扫描

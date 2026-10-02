@@ -346,13 +346,17 @@ function setSectionState(sectionId, action, clientName) {
 /* --------------------------- 进路走行事件（序号） --------------------------- */
 
 /**
- * 按进路实例提交占用/清空事件。
+ * 按进路实例提交占用/清空事件（人工接口包装）。
  * 规则：
  *  - seq 必须等于实例 next_seq（严格递增）；小则重传，大则跳号。
  *  - 同号同内容：幂等成功，不重复生效；同号异内容：拒绝。
  *  - 占用：只能作用于"当前可进入区段" head_step；首段被占用 → 信号回红。
  *  - 清空：只能作用于"当前最早未出清区段" tail_step；清空后删除该区段锁（逐段解锁）；
  *    清空末段后整条进路自动解除（实例 released，道岔锁随之释放）。
+ *
+ * 人工事件在同一事务内使该实例的活动定时走行计划前提失效（人工抢先），
+ * 计划立即停止，人工结果原样保留；定时走行计划自身注入走 source='plan'
+ * 的 submitSectionEventInTxn，不触发该钩子。
  */
 function submitSectionEvent(instanceId, seq, sectionId, action, clientName) {
   if (!Number.isInteger(seq) || seq < 1) {
@@ -364,108 +368,14 @@ function submitSectionEvent(instanceId, seq, sectionId, action, clientName) {
 
   const db = getDb();
   const txn = db.transaction(() => {
-    const inst = getInstance(instanceId);
-    const steps = getRouteSteps(inst.route_id);
-    const lastStep = steps.length;
-
-    // 1) 序号校验（幂等 / 冲突 / 跳号）
-    const existing = db.prepare(
-      `SELECT seq, section_id, action FROM section_events WHERE instance_id=? AND seq=?`
-    ).get(instanceId, seq);
-
-    if (existing) {
-      if (existing.section_id === sectionId && existing.action === action) {
-        return { idempotent: true, instanceId, seq, sectionId, action };
-      }
-      throw new InterlockError(409, 'SEQ_CONFLICT',
-        `序号 ${seq} 已用于 ${existing.action === 'occupy' ? '占用' : '清空'} 区段 ${existing.section_id}，` +
-        `不能再提交为${action === 'occupy' ? '占用' : '清空'}区段 ${sectionId}（同号异内容拒绝）`,
-        { seq, existing, received: { sectionId, action } });
+    const r = submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName, 'manual');
+    // 人工事件（非幂等重传）抢先改变了走行进度：同事务停止活动定时走行计划，
+    // 不覆盖人工结果；幂等重传不重复处理计划。
+    if (!r.idempotent) {
+      r.planAborted = require('./movement-plan').abortActiveByManualInTxn(
+        instanceId, `人工走行事件抢先改变进度（序号 ${seq}：${action === 'occupy' ? '占用' : '清空'} 区段 ${sectionId}），定时走行计划停止；人工结果保留`);
     }
-    if (seq < inst.next_seq) {
-      // 理论上上面已命中历史事件，兜底
-      throw new InterlockError(409, 'SEQ_CONFLICT', `序号 ${seq} 已使用（同号异内容）`);
-    }
-    if (seq > inst.next_seq) {
-      throw new InterlockError(409, 'SEQ_GAP',
-        `跳号拒绝：期望下一个序号为 ${inst.next_seq}，收到 ${seq}（涉及区段 ${sectionId}）`,
-        { expectedSeq: inst.next_seq, receivedSeq: seq, sectionId });
-    }
-
-    // 2) 区段归属校验
-    const step = steps.find((s) => s.section_id === sectionId);
-    if (!step) {
-      throw new InterlockError(400, 'SECTION_NOT_IN_ROUTE',
-        `区段 ${sectionId} 不属于进路 ${inst.route_id}（实例 #${instanceId}）的经过区段`,
-        { sectionId, routeId: inst.route_id });
-    }
-
-    // 3) 走行顺序校验 + 状态变更
-    if (action === 'occupy') {
-      if (step.step_order !== inst.head_step) {
-        throw new InterlockError(409, 'OUT_OF_ORDER',
-          `占用顺序不符：当前应进入第 ${inst.head_step} 个区段 ${steps[inst.head_step - 1].section_id}，` +
-          `收到的是第 ${step.step_order} 个区段 ${sectionId}`,
-          { sectionId, expectedSection: steps[inst.head_step - 1].section_id });
-      }
-      db.prepare(`UPDATE sections SET occ_state='occupied' WHERE id=?`).run(sectionId);
-      db.prepare(
-        `INSERT INTO section_events(instance_id,seq,section_id,action,client) VALUES(?,?,?,?,?)`
-      ).run(instanceId, seq, sectionId, action, clientName);
-
-      const updates = ['next_seq = next_seq + 1', 'head_step = head_step + 1'];
-      // 列车进入首段 → 入口信号回红
-      if (step.step_order === 1) updates.push(`signal_state='red'`);
-      db.prepare(`UPDATE route_instances SET ${updates.join(', ')} WHERE id=?`).run(instanceId);
-
-      // 首段占用：若该实例有 pending 的延时取消申请，同一事务内终止（锁闭保留）
-      let cancellationAborted = null;
-      if (step.step_order === 1) {
-        cancellationAborted = require('./cancellation').abortPendingByOccupyInTxn(instanceId);
-      }
-
-      return { idempotent: false, instanceId, seq, sectionId, action,
-        signalTurnedRed: step.step_order === 1, cancellationAborted };
-    }
-
-    // action === 'clear'
-    if (step.step_order !== inst.tail_step) {
-      throw new InterlockError(409, 'OUT_OF_ORDER',
-        `清空顺序不符：当前应先出清第 ${inst.tail_step} 个区段 ${steps[inst.tail_step - 1].section_id}，` +
-        `不能提前清空第 ${step.step_order} 个区段 ${sectionId}（须按走行方向逐段解锁）`,
-        { sectionId, expectedSection: steps[inst.tail_step - 1].section_id });
-    }
-    const sec = db.prepare(`SELECT occ_state FROM sections WHERE id=?`).get(sectionId);
-    if (sec.occ_state !== 'occupied') {
-      throw new InterlockError(409, 'NOT_OCCUPIED',
-        `区段 ${sectionId} 当前并非占用状态（${sec.occ_state === 'unknown' ? '未知' : '空闲'}），不能提交清空事件`,
-        { sectionId, state: sec.occ_state });
-    }
-
-    db.prepare(`UPDATE sections SET occ_state='free' WHERE id=?`).run(sectionId);
-    db.prepare(
-      `INSERT INTO section_events(instance_id,seq,section_id,action,client) VALUES(?,?,?,?,?)`
-    ).run(instanceId, seq, sectionId, action, clientName);
-    // 逐段解锁：删除该区段锁
-    db.prepare(
-      `DELETE FROM route_locks WHERE instance_id=? AND resource_type='section' AND resource_id=?`
-    ).run(instanceId, sectionId);
-
-    if (step.step_order === lastStep) {
-      // 末段已清空 → 整条进路解除（道岔锁随实例删除，保留实例/事件记录供复盘）
-      db.prepare(
-        `UPDATE route_instances SET status='released', signal_state='red',
-                next_seq=next_seq+1, tail_step=tail_step+1, released_at=datetime('now')
-         WHERE id=?`
-      ).run(instanceId);
-      db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
-      return { idempotent: false, instanceId, seq, sectionId, action, routeReleased: true };
-    }
-
-    db.prepare(
-      `UPDATE route_instances SET next_seq=next_seq+1, tail_step=tail_step+1 WHERE id=?`
-    ).run(instanceId);
-    return { idempotent: false, instanceId, seq, sectionId, action, sectionUnlocked: true };
+    return r;
   });
 
   const result = txn();
@@ -473,6 +383,119 @@ function submitSectionEvent(instanceId, seq, sectionId, action, clientName) {
   // 走行事件可能逐段解锁或整条进路解除 → 自动尝试兑现等待申请
   triggerWaitingSweep('section_event');
   return result;
+}
+
+/**
+ * 走行事件事务体（人工提交与定时走行计划到期注入共用同一份序号/走行校验与
+ * 状态推进代码路径，保证信号回红、逐段解锁、延时取消终止等规则完全一致）。
+ * 必须在外层事务/SAVEPOINT 内调用。
+ *
+ * @param {string} source 'manual' 人工接口 / 'plan' 定时走行计划到期自动注入
+ */
+function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName, source = 'manual') {
+  const db = getDb();
+  const inst = getInstance(instanceId);
+  const steps = getRouteSteps(inst.route_id);
+  const lastStep = steps.length;
+
+  // 1) 序号校验（幂等 / 冲突 / 跳号）
+  const existing = db.prepare(
+    `SELECT seq, section_id, action FROM section_events WHERE instance_id=? AND seq=?`
+  ).get(instanceId, seq);
+
+  if (existing) {
+    if (existing.section_id === sectionId && existing.action === action) {
+      return { idempotent: true, instanceId, seq, sectionId, action };
+    }
+    throw new InterlockError(409, 'SEQ_CONFLICT',
+      `序号 ${seq} 已用于 ${existing.action === 'occupy' ? '占用' : '清空'} 区段 ${existing.section_id}，` +
+      `不能再提交为${action === 'occupy' ? '占用' : '清空'}区段 ${sectionId}（同号异内容拒绝）`,
+      { seq, existing, received: { sectionId, action } });
+  }
+  if (seq < inst.next_seq) {
+    // 理论上上面已命中历史事件，兜底
+    throw new InterlockError(409, 'SEQ_CONFLICT', `序号 ${seq} 已使用（同号异内容）`);
+  }
+  if (seq > inst.next_seq) {
+    throw new InterlockError(409, 'SEQ_GAP',
+      `跳号拒绝：期望下一个序号为 ${inst.next_seq}，收到 ${seq}（涉及区段 ${sectionId}）`,
+      { expectedSeq: inst.next_seq, receivedSeq: seq, sectionId });
+  }
+
+  // 2) 区段归属校验
+  const step = steps.find((s) => s.section_id === sectionId);
+  if (!step) {
+    throw new InterlockError(400, 'SECTION_NOT_IN_ROUTE',
+      `区段 ${sectionId} 不属于进路 ${inst.route_id}（实例 #${instanceId}）的经过区段`,
+      { sectionId, routeId: inst.route_id });
+  }
+
+  // 3) 走行顺序校验 + 状态变更
+  if (action === 'occupy') {
+    if (step.step_order !== inst.head_step) {
+      throw new InterlockError(409, 'OUT_OF_ORDER',
+        `占用顺序不符：当前应进入第 ${inst.head_step} 个区段 ${steps[inst.head_step - 1].section_id}，` +
+        `收到的是第 ${step.step_order} 个区段 ${sectionId}`,
+        { sectionId, expectedSection: steps[inst.head_step - 1].section_id });
+    }
+    db.prepare(`UPDATE sections SET occ_state='occupied' WHERE id=?`).run(sectionId);
+    db.prepare(
+      `INSERT INTO section_events(instance_id,seq,section_id,action,client) VALUES(?,?,?,?,?)`
+    ).run(instanceId, seq, sectionId, action, clientName);
+
+    const updates = ['next_seq = next_seq + 1', 'head_step = head_step + 1'];
+    // 列车进入首段 → 入口信号回红
+    if (step.step_order === 1) updates.push(`signal_state='red'`);
+    db.prepare(`UPDATE route_instances SET ${updates.join(', ')} WHERE id=?`).run(instanceId);
+
+    // 首段占用：若该实例有 pending 的延时取消申请，同一事务内终止（锁闭保留）
+    let cancellationAborted = null;
+    if (step.step_order === 1) {
+      cancellationAborted = require('./cancellation').abortPendingByOccupyInTxn(instanceId);
+    }
+
+    return { idempotent: false, instanceId, seq, sectionId, action,
+      signalTurnedRed: step.step_order === 1, cancellationAborted };
+  }
+
+  // action === 'clear'
+  if (step.step_order !== inst.tail_step) {
+    throw new InterlockError(409, 'OUT_OF_ORDER',
+      `清空顺序不符：当前应先出清第 ${inst.tail_step} 个区段 ${steps[inst.tail_step - 1].section_id}，` +
+      `不能提前清空第 ${step.step_order} 个区段 ${sectionId}（须按走行方向逐段解锁）`,
+      { sectionId, expectedSection: steps[inst.tail_step - 1].section_id });
+  }
+  const sec = db.prepare(`SELECT occ_state FROM sections WHERE id=?`).get(sectionId);
+  if (sec.occ_state !== 'occupied') {
+    throw new InterlockError(409, 'NOT_OCCUPIED',
+      `区段 ${sectionId} 当前并非占用状态（${sec.occ_state === 'unknown' ? '未知' : '空闲'}），不能提交清空事件`,
+      { sectionId, state: sec.occ_state });
+  }
+
+  db.prepare(`UPDATE sections SET occ_state='free' WHERE id=?`).run(sectionId);
+  db.prepare(
+    `INSERT INTO section_events(instance_id,seq,section_id,action,client) VALUES(?,?,?,?,?)`
+  ).run(instanceId, seq, sectionId, action, clientName);
+  // 逐段解锁：删除该区段锁
+  db.prepare(
+    `DELETE FROM route_locks WHERE instance_id=? AND resource_type='section' AND resource_id=?`
+  ).run(instanceId, sectionId);
+
+  if (step.step_order === lastStep) {
+    // 末段已清空 → 整条进路解除（道岔锁随实例删除，保留实例/事件记录供复盘）
+    db.prepare(
+      `UPDATE route_instances SET status='released', signal_state='red',
+              next_seq=next_seq+1, tail_step=tail_step+1, released_at=datetime('now')
+       WHERE id=?`
+    ).run(instanceId);
+    db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
+    return { idempotent: false, instanceId, seq, sectionId, action, routeReleased: true };
+  }
+
+  db.prepare(
+    `UPDATE route_instances SET next_seq=next_seq+1, tail_step=tail_step+1 WHERE id=?`
+  ).run(instanceId);
+  return { idempotent: false, instanceId, seq, sectionId, action, sectionUnlocked: true };
 }
 
 /* ------------------------------ 人工解除进路 ------------------------------ */
@@ -501,6 +524,9 @@ function releaseInstance(instanceId, clientName) {
       `UPDATE route_instances SET status='released', released_at=datetime('now') WHERE id=?`
     ).run(instanceId);
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
+    // 人工/兜底解除：同事务停止活动定时走行计划（人工结果保留，不覆盖）
+    require('./movement-plan').abortActiveByManualInTxn(
+      instanceId, '进路被人工解除，定时走行计划停止；人工结果保留');
   });
   txn();
   // 进路解除后资源释放 → 自动尝试兑现等待申请
@@ -581,7 +607,10 @@ function getState() {
     blockades: require('./blockade').listBlockades(),
     blockadesBySection: require('./blockade').unfinishedBySection(),
     // 交接班交接单（最近 200 张；待签收在前，刷新/重启后仍可查询与签收）
-    handovers: require('./handover').listHandovers()
+    handovers: require('./handover').listHandovers(),
+    // 定时走行计划：全部计划（值班台查看/终止）+ 活动计划按实例索引
+    movementPlans: require('./movement-plan').listPlans(),
+    activeMovementPlans: require('./movement-plan').activeByInstance()
   };
 }
 
@@ -624,6 +653,7 @@ module.exports = {
   moveSwitch,
   setSectionState,
   submitSectionEvent,
+  submitSectionEventInTxn,
   releaseInstance,
   getState,
   getInstanceDetail,

@@ -110,6 +110,10 @@ function requestCancellation(instanceId, clientName) {
     // 立即令入口信号回红（即便已是红也无副作用）；区段/道岔锁原样保留
     db.prepare(`UPDATE route_instances SET signal_state='red' WHERE id=?`).run(instanceId);
 
+    // 该实例若有活动定时走行计划：信号已回红、进入延时取消流程，计划前提失效，
+    // 同一事务内停止计划（人工/取消结果保留，不让计划随后继续注入）。
+    require('./movement-plan').abortActiveByCancellationInTxn(instanceId);
+
     return {
       row: db.prepare(`SELECT * FROM cancellation_applications WHERE id=?`).get(info.lastInsertRowid),
       created: true

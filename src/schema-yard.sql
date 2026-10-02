@@ -231,6 +231,60 @@ CREATE TABLE IF NOT EXISTS handover_documents (
 );
 CREATE INDEX IF NOT EXISTS idx_handover_status ON handover_documents(status, id);
 
+-- 定时走行计划（值班员对已开放且尚未走行的进路提交的自动走行编排）：
+--  - 步骤按进路区段顺序交替列出 占用(odd)/清空(even)，每步等待正整数秒；
+--  - 首步从提交时刻计时，后续每步从上一步【成功】时刻计时（due_at 在进入
+--    pending 时写入）；到期在同一事务内沿用现有事件序号与走行校验提交事件，
+--    成功才推进计划，信号回红、逐段解锁、等待兑现均走现有规则；
+--  - 人工事件抢先改变进度、延时取消申请、实例解除等前提失效时计划停止
+--    （aborted，人工结果原样保留，不覆盖、不重发事件）；末步成功后 completed；
+--    本人终止（terminated）只停止后续注入，不解除进路；
+--  - 同一实例同时至多一笔活动计划（active/paused 部分唯一索引兜底）；
+--  - 管理员重置删除进路实例时经外键级联一并清除；创建副本时不复制活动计划。
+CREATE TABLE IF NOT EXISTS movement_plans (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  instance_id INTEGER NOT NULL REFERENCES route_instances(id) ON DELETE CASCADE,
+  applicant   TEXT NOT NULL,             -- 提交人（值班员姓名）
+  route_id    TEXT NOT NULL,             -- 提交时进路编号快照（展示用）
+  -- active 执行中（有下一步等待到期）/ completed 末步成功，整条走行完成 /
+  -- aborted 前提失效（人工抢先/延时取消/实例解除/到期走行校验未通过）/
+  -- terminated 提交人主动终止（仅停止后续注入，不解除进路）
+  status      TEXT NOT NULL DEFAULT 'active'
+              CHECK (status IN ('active','completed','aborted','terminated')),
+  total_steps INTEGER NOT NULL,          -- 计划总步数（= 进路区段数 × 2）
+  current_step INTEGER NOT NULL DEFAULT 1, -- 下一步待执行步号；全部完成后为 total_steps+1
+  created_at  INTEGER NOT NULL,          -- 提交时刻（epoch 毫秒，首步计时起点）
+  ended_at    INTEGER,                   -- 进入终态时刻（epoch 毫秒）
+  end_reason  TEXT                       -- 停止/完成说明
+);
+
+-- 同一进路实例同时至多一笔活动（active）定时走行计划
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_active_instance
+  ON movement_plans(instance_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_plan_status ON movement_plans(status, id);
+CREATE INDEX IF NOT EXISTS idx_plan_applicant ON movement_plans(applicant);
+
+-- 定时走行计划步骤：
+--  - step_order 从 1 起；奇数=占用（区段按 step_order 1,2,3…映射），偶数=清空；
+--  - wait_seconds 为该步等待时长（正整数秒）；
+--  - pending 待到期注入 / done 已成功注入；注入产生的走行事件 seq 记录在 event_seq；
+--  - due_at 为到期时刻（epoch 毫秒）：首步=提交时刻+等待，后续=上一步成功时刻+等待。
+CREATE TABLE IF NOT EXISTS movement_plan_steps (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id      INTEGER NOT NULL REFERENCES movement_plans(id) ON DELETE CASCADE,
+  step_order   INTEGER NOT NULL,
+  section_id   TEXT NOT NULL,
+  action       TEXT NOT NULL CHECK (action IN ('occupy','clear')),
+  wait_seconds INTEGER NOT NULL,
+  due_at       INTEGER,                  -- 进入 pending 时写入（epoch 毫秒）
+  status       TEXT NOT NULL DEFAULT 'pending'
+               CHECK (status IN ('pending','done')),
+  event_seq    INTEGER,                  -- 成功注入后对应的走行事件序号
+  UNIQUE (plan_id, step_order)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_steps_due
+  ON movement_plan_steps(status, due_at);
+
 CREATE INDEX IF NOT EXISTS idx_locks_instance ON route_locks(instance_id);
 CREATE INDEX IF NOT EXISTS idx_events_instance ON section_events(instance_id, seq);
 CREATE INDEX IF NOT EXISTS idx_steps_route ON route_steps(route_id, step_order);
